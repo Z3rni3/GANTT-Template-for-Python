@@ -49,25 +49,6 @@ The same engine and the same features as Medium. The difference is the example: 
 
 ![Advanced template](gantt_chart_advanced.png)
 
-## Getting started
-
-1. Install the requirements once:
-
-   ```bash
-   pip install pandas matplotlib
-   ```
-
-2. Download one of the templates, open it and edit the section called **YOUR PLAN**. Every template starts with a short explanation of all options.
-3. Run it with Python:
-
-   ```bash
-   python <name-of-the-template-file>
-   ```
-
-The picture is saved next to the file. The file name can be changed in the template.
-
-If something in your plan does not make sense (for example a task that ends before it starts), the template stops with a short message that tells you which row to fix.
-
 ## Made openly with AI
 
 These templates were created openly together with an AI assistant, [Claude](https://claude.ai) by Anthropic. I described what I needed (the look, the features and how it should be used), the AI wrote the code and tested it with example plans and with deliberately broken plans, and I reviewed the results and tried them myself. This README was written with the same assistant.
