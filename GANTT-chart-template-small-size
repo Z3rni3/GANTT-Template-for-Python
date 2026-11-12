@@ -1,0 +1,235 @@
+"""
+BASIC GANTT CHART TEMPLATE
+==========================
+The simplest version: phases, tasks and milestones. Nothing else.
+
+HOW TO USE
+----------
+1. Install the requirements once:      pip install pandas matplotlib
+2. Edit the title and the list `rows` in section 1 below.
+3. Run:                                python gantt_template_basic.py
+   -> the chart is saved as gantt_chart.png
+
+THE THREE BUILDING BLOCKS
+-------------------------
+G("Phase name")                          a phase (its bar is calculated from its tasks)
+T("Task name", "start", "end")           a task; optional: progress=0.4 (= 40 % done)
+M("Milestone name", "date")              a milestone (diamond)
+
+Dates are written as "YYYY-MM-DD". The end date is included (a task that ends on the 22nd
+occupies the whole 22nd). Every task and milestone belongs to the phase above it, so start
+each part of the plan with a G(...). Rows are drawn in the order of the list.
+"""
+
+import warnings
+
+import pandas as pd
+import matplotlib
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from matplotlib.patches import Rectangle, Patch
+from matplotlib.lines import Line2D
+
+# Hides a harmless notice that some Matplotlib 3.10 installations (e.g. Google Colab) print.
+warnings.filterwarnings("ignore", message=r".*parameter as float was deprecated.*",
+                        category=matplotlib.MatplotlibDeprecationWarning)
+
+# ------------------------------------------------------------
+# 1) YOUR PLAN  (edit this section)
+# ------------------------------------------------------------
+TITLE       = "Project Gantt Chart"
+SUBTITLE    = "Course / project name - Your name"
+OUTPUT_FILE = "gantt_chart.png"          # .png / .pdf / .svg
+
+
+def G(name):
+    return {"kind": "group", "name": name}
+
+
+def T(name, start, end, progress=0.0):
+    return {"kind": "task", "name": name, "start": pd.Timestamp(start),
+            "end": pd.Timestamp(end), "progress": progress}
+
+
+def M(name, date):
+    return {"kind": "milestone", "name": name, "start": pd.Timestamp(date),
+            "end": pd.Timestamp(date)}
+
+
+# Example data - replace with your own plan.
+rows = [
+    G("Phase 1: Preparation"),
+    T("Define topic & research question", "2026-11-02", "2026-11-08", progress=1.0),
+    T("Literature search",                 "2026-11-09", "2026-11-22", progress=0.4),
+    M("Literature collected",              "2026-11-22"),
+
+    G("Phase 2: Implementation"),
+    T("Set up method / experiment",        "2026-11-23", "2026-12-06"),
+    T("Collect data",                      "2026-12-07", "2026-12-20"),
+    T("Analyse results",                   "2026-12-21", "2027-01-03"),
+    M("Results available",                 "2027-01-03"),
+
+    G("Phase 3: Writing"),
+    T("Write draft",                       "2027-01-04", "2027-01-17"),
+    T("Revision & feedback",               "2027-01-18", "2027-01-24"),
+    T("Final proofreading",                "2027-01-25", "2027-01-31"),
+    M("Submission",                        "2027-01-31"),
+]
+
+# ============================================================
+# Nothing to edit below this line
+# ============================================================
+
+# ------------------------------------------------------------
+# 2) Check the plan and calculate the phase bars
+# ------------------------------------------------------------
+group = None
+for r in rows:
+    if r["kind"] == "group":
+        group = r
+        group["tasks"] = []
+        continue
+    if group is None:
+        raise ValueError(f"'{r['name']}' is not inside a phase. Start the plan with a G(...).")
+    if r["end"] < r["start"]:
+        raise ValueError(f"'{r['name']}': the end date is before the start date.")
+    if r["kind"] == "task":
+        if not 0 <= r["progress"] <= 1:
+            raise ValueError(f"'{r['name']}': progress must be between 0.0 and 1.0.")
+        group["tasks"].append(r)
+
+for g in (r for r in rows if r["kind"] == "group"):
+    if not g["tasks"]:
+        raise ValueError(f"Phase '{g['name']}' has no tasks. Add at least one T(...) below it.")
+    g["start"] = min(t["start"] for t in g["tasks"])
+    g["end"] = max(t["end"] for t in g["tasks"])
+    days = [(t["end"] - t["start"]).days + 1 for t in g["tasks"]]
+    g["progress"] = sum(t["progress"] * d for t, d in zip(g["tasks"], days)) / sum(days)
+
+n = len(rows)
+first = min(r["start"] for r in rows)
+last = max(r["end"] for r in rows)
+start_week = first - pd.Timedelta(days=first.weekday())            # Monday of the first week
+pad = last + pd.Timedelta(days=2)
+end_week = pad if pad.weekday() == 0 else pad + pd.Timedelta(days=7 - pad.weekday())
+x_left, x_right = mdates.date2num(start_week), mdates.date2num(end_week)
+
+# ------------------------------------------------------------
+# 3) Layout and style
+# ------------------------------------------------------------
+TEXT, MUTED, GRID = "#1F2937", "#6B7280", "#E5E7EB"
+PHASE_DARK, PHASE_LIGHT = "#0A9D7C", "#00B88F"
+TASK_DARK, TASK_LIGHT = "#2169D8", "#3B82E8"
+MILESTONE, MILESTONE_TEXT, TODAY = "#C77DF0", "#8E3BBF", "#EF4444"
+
+plt.rcParams["font.family"] = "sans-serif"
+plt.rcParams["font.sans-serif"] = ["Segoe UI", "Helvetica Neue", "Arial", "DejaVu Sans"]
+
+ROW_IN, TABLE_IN, TIMELINE_IN, MARGIN_IN = 0.38, 4.2, 9.6, 0.45
+axes_h = (n + 2) * ROW_IN
+fig_w = MARGIN_IN * 2 + TABLE_IN + TIMELINE_IN
+fig_h = 1.25 + axes_h + 1.0
+day_in = TIMELINE_IN / (x_right - x_left)                          # inches per day
+
+fig = plt.figure(figsize=(fig_w, fig_h), facecolor="white")
+ax_t = fig.add_axes([MARGIN_IN / fig_w, 0.9 / fig_h, TABLE_IN / fig_w, axes_h / fig_h])
+ax_g = fig.add_axes([(MARGIN_IN + TABLE_IN) / fig_w, 0.9 / fig_h, TIMELINE_IN / fig_w, axes_h / fig_h])
+for ax in (ax_t, ax_g):
+    ax.set_ylim(n, -2)
+    ax.axis("off")
+ax_t.set_xlim(0, TABLE_IN)                                         # 1 unit = 1 inch
+ax_g.set_xlim(x_left, x_right)
+
+fig.text(MARGIN_IN / fig_w, 1 - 0.55 / fig_h, TITLE, fontsize=18, fontweight="bold", color=TEXT)
+fig.text(MARGIN_IN / fig_w, 1 - 0.85 / fig_h, SUBTITLE, fontsize=10, color=MUTED)
+
+# ------------------------------------------------------------
+# 4) Grid and header (months + calendar weeks)
+# ------------------------------------------------------------
+ax_t.add_patch(Rectangle((0, -2), TABLE_IN, 2, fc="#F9FAFB", ec="none"))              # header band
+ax_g.add_patch(Rectangle((x_left, -2), x_right - x_left, 2, fc="#F9FAFB", ec="none"))
+for y in [-2] + list(range(n + 1)):                                                   # row lines
+    ax_t.axhline(y, color=GRID, lw=0.8, zorder=1)
+    ax_g.axhline(y, color=GRID, lw=0.8, zorder=1)
+ax_g.axhline(-1, color=GRID, lw=0.8, zorder=1)                                        # months | weeks
+
+for month in pd.date_range(start_week.replace(day=1), end_week, freq="MS"):
+    x0 = mdates.date2num(max(month, start_week))
+    x1 = mdates.date2num(min(month + pd.offsets.MonthBegin(1), end_week))
+    if x1 > x0:
+        label = f"{month:%B %Y}" if (x1 - x0) * day_in >= 1.25 else f"{month:%b}"
+        ax_g.text((x0 + x1) / 2, -1.5, label, ha="center", va="center",
+                  fontsize=9.5, fontweight="bold", color=TEXT)
+        ax_g.plot([x0, x0], [-2, -1], color=GRID, lw=0.8, zorder=1)               # month divider
+
+week_step = max(1, round(0.5 / (7 * day_in)))                      # fewer labels on long plans
+for i, monday in enumerate(pd.date_range(start_week, end_week, freq="W-MON")):
+    xw = mdates.date2num(monday)
+    ax_g.plot([xw, xw], [-1, n], color=GRID, lw=0.8, zorder=1)
+    if monday < end_week and i % week_step == 0:
+        ax_g.text(xw + 3.5, -0.5, f"CW {monday.isocalendar()[1]}", ha="center", va="center",
+                  fontsize=8, color=MUTED)
+
+# ------------------------------------------------------------
+# 5) Table (left)
+# ------------------------------------------------------------
+COL_START, COL_END = 2.75, 3.5
+for x, head in ((0.09, "Task"), (COL_START, "Start"), (COL_END, "End")):
+    ax_t.text(x, -1, head, va="center", fontsize=9.5, fontweight="bold", color=MUTED)
+
+for i, r in enumerate(rows):
+    y = i + 0.5
+    name = r["name"] if len(r["name"]) <= 34 else r["name"][:33] + "…"          # keep names short
+    if r["kind"] == "group":
+        ax_t.text(0.09, y, "▾  " + name, va="center", fontsize=9.5, fontweight="bold", color=TEXT)
+    elif r["kind"] == "task":
+        ax_t.text(0.31, y, name, va="center", fontsize=9, color=TEXT)
+    else:
+        ax_t.text(0.31, y, "◆  " + name, va="center", fontsize=9, color=MILESTONE_TEXT)
+    if r["kind"] != "milestone":
+        ax_t.text(COL_START, y, f"{r['start']:%b %d}", va="center", fontsize=8.5, color=MUTED)
+    ax_t.text(COL_END, y, f"{r['end']:%b %d}", va="center", fontsize=8.5, color=MUTED)
+
+# ------------------------------------------------------------
+# 6) Bars and milestones
+# ------------------------------------------------------------
+for i, r in enumerate(rows):
+    y = i + 0.5
+    if r["kind"] == "milestone":
+        ax_g.scatter([mdates.date2num(r["end"]) + 1], [y], marker="D", s=110, color=MILESTONE,
+                     edgecolors="white", linewidths=1.2, zorder=5)
+        continue
+    height, dark, light = (0.62, PHASE_DARK, PHASE_LIGHT) if r["kind"] == "group" \
+        else (0.5, TASK_DARK, TASK_LIGHT)
+    xs = mdates.date2num(r["start"])
+    width = mdates.date2num(r["end"]) + 1 - xs                     # end date is included
+    ax_g.add_patch(Rectangle((xs, y - height / 2), width, height, fc=light, ec="none", zorder=2))
+    if r["progress"] > 0:
+        ax_g.add_patch(Rectangle((xs, y - height / 2), width * r["progress"], height,
+                                 fc=dark, ec="none", zorder=2.1))
+        if width * day_in >= 0.4:
+            ax_g.text(xs + 0.07 / day_in, y, f"{r['progress']:.0%}", va="center", fontsize=7.5,
+                      fontweight="bold", color="white", zorder=3)
+
+# ------------------------------------------------------------
+# 7) "Today" line (only if today lies inside the plan) and legend
+# ------------------------------------------------------------
+today = pd.Timestamp.today().normalize()
+if start_week <= today <= end_week:
+    xt = mdates.date2num(today)
+    ax_g.plot([xt, xt], [0, n], color=TODAY, lw=1.4, ls="--", zorder=4)
+    ax_g.text(xt, n + 0.6, "Today", ha="center", va="center", fontsize=7.5, fontweight="bold",
+              color="white", bbox=dict(boxstyle="round,pad=0.25", fc=TODAY, ec="none"))
+
+fig.legend(handles=[
+    Patch(facecolor=PHASE_LIGHT, label="Phase"),
+    Patch(facecolor=TASK_LIGHT, label="Task"),
+    Patch(facecolor=TASK_DARK, label="Completed share"),
+    Line2D([0], [0], marker="D", color="none", markerfacecolor=MILESTONE,
+           markeredgecolor="white", markersize=9, label="Milestone"),
+], loc="lower center", bbox_to_anchor=(0.5, 0.15 / fig_h), ncol=4, frameon=False,
+    fontsize=9, labelcolor=MUTED)
+
+plt.savefig(OUTPUT_FILE, dpi=300, bbox_inches="tight", pad_inches=0.3, facecolor="white")
+print(f"Saved {OUTPUT_FILE}")
+plt.show()
