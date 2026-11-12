@@ -1,0 +1,1024 @@
+"""
+GANTT CHART TEMPLATE  (extended edition)
+========================================
+A self-contained template for clean project Gantt charts (matplotlib + pandas).
+
+HOW TO USE
+----------
+1. Install the requirements once:      pip install pandas matplotlib
+2. Edit section "1) YOUR PLAN" below (title, settings, rows).
+3. Run:                                python gantt_template.py
+   -> the chart is saved as gantt_chart.png (and shown on screen).
+
+BUILDING BLOCKS (used inside `rows`)
+------------------------------------
+G(name, ...)                        phase / group header (its bar is computed from its tasks)
+T(id, name, start, end, ...)        task
+M(id, name, date, ...)              milestone  (your own target, drawn as a diamond)
+D(id, name, date, ...)              deadline   (fixed by someone else, drawn as a red flag)
+E(id, name, start, end, ...)        fixed date / event (seminar, meeting, exam period ...)
+
+Use `None` as id if nobody needs to refer to the row:  T(None, "Write notes", ...)
+A row belongs to the phase G(...) above it.
+
+ALL ARGUMENTS
+-------------
+Dates (all as "YYYY-MM-DD"; the end date is INCLUSIVE; D() also accepts "YYYY-MM-DD HH:MM")
+
+    start, end       first and last day
+    duration         length in days (or working days, see DURATION_IN_WORKDAYS)
+    date             day of a milestone / deadline
+
+    A task needs two of  start / end / duration.  Everything else is derived:
+        start + end        -> duration is calculated
+        start + duration   -> end is calculated
+        end   + duration   -> start is calculated (planning backwards)
+        dep   + duration   -> start is calculated from the predecessor (auto-scheduling)
+        dep   + end        -> start is calculated from the predecessor
+    A milestone without a date takes it from its predecessor (dep).
+
+Links
+    dep              predecessor(s), see DEPENDENCIES below
+    buffer           days of slack reserved after the task (drawn dashed, auto-scheduled
+                     successors start after it)
+
+Look
+    ext=True         depends on something outside your control (orange, hatched)
+    color="#RRGGBB"  own color for this bar / marker
+    progress         0.0 - 1.0, completed share (dark part of the bar). If left out:
+                     1.0 for status "done", otherwise 0. Phases are averaged from their tasks.
+    baseline         ("YYYY-MM-DD", "YYYY-MM-DD") original plan, drawn as a thin grey bar
+
+Information (shown in the table and/or next to the bar)
+    owner            who is responsible, e.g. "AB"
+    status           "not started" | "in progress" | "done" | "at risk" | "blocked"
+    priority         "high" | "medium" | "low"  (any text works, these three are colored)
+    note             short remark shown next to the bar, e.g. "waiting for lab"
+
+DEPENDENCIES
+------------
+    dep="t1"             finish-to-start: starts the day after t1 ends
+    dep="t1:SS"          start-to-start:  starts together with t1
+    dep="t1:FF"          finish-to-finish: ends together with t1
+    dep="t1:SS+7"        ...with a lag of 7 days  (negative values = overlap, e.g. "t1-2")
+    dep=["a", "b:FF"]    several predecessors; the latest one decides the start
+
+SETTINGS
+--------
+Everything in "SETTINGS" below: title, table columns, language of the labels, status date
+("today"), non-working periods (holidays, breaks), weekend shading, working-day durations,
+fixed time range, output file and resolution.
+
+RULES OF THUMB
+--------------
+* Put a task DIRECTLY BELOW its predecessor if you use `dep`; arrows then stay short.
+* ids are unique and may contain letters, digits and underscore only.
+* If something is wrong with the plan (unknown id, missing dates, circular dependency ...)
+  the script stops with a readable message. A dependency that is violated by manually
+  entered dates only prints a WARNING.
+* The red "Today" marker only appears if the status date lies inside the plan period.
+"""
+
+import math
+import re
+
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+import matplotlib.colors as mcolors
+from matplotlib.patches import Rectangle, FancyBboxPatch, Patch
+from matplotlib.lines import Line2D
+
+
+class PlanError(ValueError):
+    """Raised with a readable message when the plan contains a mistake."""
+
+
+# ------------------------------------------------------------
+# 0) Style (colors & fonts) - change here if you want another look
+# ------------------------------------------------------------
+plt.rcParams["font.family"] = "sans-serif"
+plt.rcParams["font.sans-serif"] = ["Segoe UI", "Helvetica Neue", "Arial", "DejaVu Sans"]
+plt.rcParams["hatch.linewidth"] = 1.0
+
+BG          = "#F5F6F8"
+GRID        = "#E5E7EB"
+TEXT        = "#1F2937"
+TEXT_MUTED  = "#6B7280"
+GROUP_DARK  = "#0A9D7C"   # phase (dark = progress)
+GROUP_LIGHT = "#00B88F"   # phase (light = remaining)
+TASK_DARK   = "#2169D8"   # task  (dark = progress)
+TASK_LIGHT  = "#3B82E8"   # task  (light = remaining)
+EXT_DARK    = "#D97706"   # externally dependent (dark = progress)
+EXT_LIGHT   = "#F59E0B"   # externally dependent (light = remaining)
+EXT_HATCH   = "#FDE6B3"
+EXT_TEXT    = "#B45309"
+MILESTONE   = "#C77DF0"
+MILESTONE_T = "#8E3BBF"
+DEADLINE    = "#DC2626"
+EVENT       = "#64748B"
+BASELINE    = "#9CA3AF"
+NONWORK_FC  = "#F1F3F5"
+NONWORK_EC  = "#D5D9DF"
+WEEKEND_FC  = "#F6F7F9"
+DEP_LINE    = "#6B7280"
+TODAY_COLOR = "#EF4444"
+
+# status -> color of the dot in the table (add your own statuses here)
+STATUS_STYLES = {
+    "not started": "#9CA3AF",
+    "in progress": "#3B82E8",
+    "done":        "#16A34A",
+    "at risk":     "#EAB308",
+    "blocked":     "#DC2626",
+}
+RISK_STATUSES   = ("at risk", "blocked")        # get a "!" marker on the bar
+PRIORITY_COLORS = {"high": "#DC2626", "medium": "#D97706", "low": "#6B7280"}
+
+# ------------------------------------------------------------
+# SETTINGS
+# ------------------------------------------------------------
+PROJECT_TITLE    = "Project Gantt Chart"
+PROJECT_SUBTITLE = "Course / project name - Your name"
+PROJECT_META     = "Version 1.0"          # small text at the top right ("" = hide)
+
+OUTPUT_FILE = "gantt_chart.png"           # .png / .pdf / .svg
+DPI         = 300
+SHOW_WINDOW = True                        # False = only save the file
+
+# Columns of the table on the left, in this order.
+# Available: "owner", "start", "end", "duration", "progress", "status", "priority"
+TABLE_COLUMNS = ["owner", "start", "end", "status"]
+DATE_FORMAT   = "%b %d"                   # e.g. "%d.%m." for 12.11.
+
+# Status date ("today" line). None = real date, "2026-12-01" = fixed date, False = hide.
+TODAY = None
+
+SHOW_DEADLINE_LINES  = True               # thin red line through the chart for every D(...)
+SHADE_WEEKENDS       = False
+DURATION_IN_WORKDAYS = False              # True: `duration` counts Mon-Fri, skipping NON_WORKING
+
+# Fixed time range of the chart (None = automatic)
+TIMELINE_START = None                     # e.g. "2026-11-01"
+TIMELINE_END   = None
+
+# Holidays, breaks, exam weeks ... shaded in the background: (first day, last day, label)
+NON_WORKING = [
+    ("2026-12-24", "2027-01-01", "Christmas break"),
+]
+
+# All texts of the chart (translate here, e.g. "week": "KW", "task": "Aufgabe")
+LABELS = {
+    "task": "Task", "owner": "Owner", "start": "Start", "end": "End", "duration": "Days",
+    "progress": "Done", "status": "Status", "priority": "Priority",
+    "week": "CW", "today": "Today",
+    "legend_phase": "Phase",
+    "legend_task": "Independent task",
+    "legend_ext": "Externally dependent (timing may shift)",
+    "legend_done": "Completed share",
+    "legend_milestone": "Milestone",
+    "legend_deadline": "Deadline",
+    "legend_event": "Fixed date / event",
+    "legend_buffer": "Buffer",
+    "legend_baseline": "Original plan (baseline)",
+    "legend_nonwork": "Non-working period",
+    "legend_risk": "At risk / blocked",
+    "legend_dep": "Dependency",
+}
+
+# ------------------------------------------------------------
+# 1) YOUR PLAN  (edit this section)
+# ------------------------------------------------------------
+def _new_row(kind, id_, name, **fields):
+    """Internal: creates the dictionary that describes one row."""
+    row = dict(kind=kind, id=None if id_ is None else str(id_), name=name, ext=False,
+               start=None, end=None, duration=None, progress=None, dep=None, buffer=0,
+               baseline=None, owner=None, status=None, priority=None, note=None, color=None)
+    row.update(fields)
+    return row
+
+
+def G(name, ext=False, *, start=None, end=None, progress=None, owner=None, status=None,
+      priority=None, note=None, color=None):
+    """Phase / group header. Bar = from the first task start to the last task end."""
+    return _new_row("group", None, name, ext=ext, start=start, end=end, progress=progress,
+                    owner=owner, status=status, priority=priority, note=note, color=color)
+
+
+def T(id_, name, start=None, end=None, *, duration=None, progress=None, dep=None, ext=False,
+      buffer=0, baseline=None, owner=None, status=None, priority=None, note=None, color=None):
+    """Task. Give two of start / end / duration (or `dep` plus a duration)."""
+    return _new_row("task", id_, name, start=start, end=end, duration=duration,
+                    progress=progress, dep=dep, ext=ext, buffer=buffer, baseline=baseline,
+                    owner=owner, status=status, priority=priority, note=note, color=color)
+
+
+def M(id_, name, date=None, *, dep=None, owner=None, status=None, priority=None, note=None,
+      color=None):
+    """Milestone. Without a date it is placed at the end of its predecessor."""
+    return _new_row("milestone", id_, name, start=date, dep=dep, owner=owner, status=status,
+                    priority=priority, note=note, color=color)
+
+
+def D(id_, name, date, *, owner=None, status=None, priority=None, note=None, color=None):
+    """Deadline set by someone else. date = "YYYY-MM-DD" or "YYYY-MM-DD HH:MM"."""
+    return _new_row("deadline", id_, name, start=date, owner=owner, status=status,
+                    priority=priority, note=note, color=color)
+
+
+def E(id_, name, start, end=None, *, owner=None, status=None, priority=None, note=None,
+      color=None):
+    """Fixed date or event. One day (only start) or a period (start and end)."""
+    return _new_row("event", id_, name, start=start, end=end, owner=owner, status=status,
+                    priority=priority, note=note, color=color)
+
+
+# Example data - replace with your own phases, tasks, milestones, deadlines and events.
+rows = [
+    G("Phase 1: Preparation", owner="Team"),
+    D("d1", "Project plan due", "2026-11-26 22:00", note="upload to course page"),
+    T("t1", "Define topic & research question", "2026-11-02", "2026-11-08",
+      owner="AB", status="done", priority="high"),
+    T("t2", "Literature search", dep="t1", duration=14, progress=0.4,
+      owner="AB", status="in progress", note="min. 15 papers"),
+    M("m1", "Literature collected", dep="t2"),
+
+    G("Phase 2: Implementation", owner="Team"),
+    T("t3", "Set up method / experiment", dep="m1", duration=14, buffer=2,
+      owner="CD", status="not started", baseline=("2026-11-23", "2026-12-02")),
+    T("t4", "Collect data", dep="t3", duration=14,
+      owner="CD", status="at risk", priority="high", note="equipment delivery pending"),
+    T("t5", "Analyse results", dep="t4:SS+7", duration=14,
+      owner="AB", status="not started", note="starts one week into data collection"),
+    M("m2", "Results available", dep="t5"),
+
+    G("External partner", ext=True),
+    T("e1", "Arrange cooperation", "2026-11-09", "2026-11-20", progress=0.3, ext=True,
+      owner="Prof", status="in progress", note="partner has not answered yet"),
+    T("e2", "Partner provides data / material", "2026-11-30", "2026-12-20", dep="e1", ext=True,
+      owner="Partner", status="not started"),
+
+    G("Writing & Finalisation"),
+    T("w1", "Write draft", dep=["m2", "e2"], duration=14, owner="AB", priority="medium"),
+    T("w2", "Revision & feedback", dep="w1", duration=7, owner="Team"),
+    T("w3", "Final proofreading", dep="w2", duration=7, owner="AB"),
+    D("d2", "Submission deadline", "2027-01-31 23:59", priority="high"),
+
+    G("Fixed dates"),
+    E("ev1", "Mid-term seminar", "2026-12-04"),
+    E("ev2", "Exam period", "2027-01-18", "2027-01-29", note="no project work planned"),
+]
+
+# ============================================================
+# Nothing to edit below this line
+# ============================================================
+
+DAY = pd.Timedelta(days=1)
+POINT_KINDS = ("milestone", "deadline")
+
+# ------------------------------------------------------------
+# 2) Validate the plan and calculate all dates
+# ------------------------------------------------------------
+_DEP_RE = re.compile(r"^(\w+)(?::(FS|SS|FF))?([+-]\d+)?$", re.IGNORECASE)
+
+
+def _fail(row, message):
+    raise PlanError(f"{row['kind'].capitalize()} '{row['name']}': {message}")
+
+
+def _ts(row, field, value):
+    """Reads a date; returns a Timestamp or None."""
+    if value is None:
+        return None
+    try:
+        ts = pd.Timestamp(value)
+    except Exception:
+        ts = pd.NaT
+    if pd.isna(ts):
+        _fail(row, f"cannot read {field} {value!r}. Please write dates as 'YYYY-MM-DD'.")
+    return ts
+
+
+def _day(row, field, value):
+    ts = _ts(row, field, value)
+    return None if ts is None else ts.normalize()
+
+
+def _parse_deps(row):
+    raw = row["dep"]
+    if raw is None:
+        return []
+    items = [raw] if isinstance(raw, str) else list(raw)
+    deps = []
+    for item in items:
+        m = _DEP_RE.match(str(item).replace(" ", ""))
+        if not m:
+            _fail(row, f"cannot read dependency {item!r}. Examples: 't1', 't1:SS', 't1:FS+2'.")
+        deps.append((m.group(1), (m.group(2) or "FS").upper(), int(m.group(3) or 0)))
+    return deps
+
+
+# --- non-working periods and working-day arithmetic ---
+NW_RANGES = []
+for _item in NON_WORKING:
+    _s, _e, *_rest = _item
+    _s, _e = pd.Timestamp(_s).normalize(), pd.Timestamp(_e).normalize()
+    if _e < _s:
+        raise PlanError(f"NON_WORKING: period {_item!r} ends before it starts.")
+    NW_RANGES.append((_s, _e, _rest[0] if _rest else ""))
+NW_DAYS = set()
+for _s, _e, _ in NW_RANGES:
+    NW_DAYS.update(pd.date_range(_s, _e))
+
+
+def is_workday(d):
+    return d.weekday() < 5 and d.normalize() not in NW_DAYS
+
+
+def next_workday(d):
+    while not is_workday(d):
+        d += DAY
+    return d
+
+
+def add_duration(start, dur):
+    """Last day of a task that starts on `start` and lasts `dur` days."""
+    if not DURATION_IN_WORKDAYS:
+        return start + (dur - 1) * DAY
+    d, left = start, dur
+    while True:
+        if is_workday(d):
+            left -= 1
+            if left == 0:
+                return d
+        d += DAY
+
+
+def sub_duration(end, dur):
+    """First day of a task that ends on `end` and lasts `dur` days."""
+    if not DURATION_IN_WORKDAYS:
+        return end - (dur - 1) * DAY
+    d, left = end, dur
+    while True:
+        if is_workday(d):
+            left -= 1
+            if left == 0:
+                return d
+        d -= DAY
+
+
+def count_days(start, end):
+    if not DURATION_IN_WORKDAYS:
+        return (end - start).days + 1
+    return sum(is_workday(d) for d in pd.date_range(start, end))
+
+
+# --- 2a) check every row ---
+byid = {}
+for r in rows:
+    k = r["kind"]
+    if k != "group":
+        if r["id"] is None:
+            r["id"] = f"_auto{len(byid) + 1}"
+        if not re.fullmatch(r"\w+", r["id"]):
+            _fail(r, f"id {r['id']!r} may only contain letters, digits and underscore.")
+        if r["id"] in byid:
+            _fail(r, f"the id '{r['id']}' is used twice. Every id must be unique.")
+        byid[r["id"]] = r
+
+    if r["status"] is not None:
+        key = str(r["status"]).strip().lower()
+        if key not in STATUS_STYLES:
+            _fail(r, f"unknown status {r['status']!r}. Allowed: {', '.join(STATUS_STYLES)}.")
+        r["status"] = key
+    if r["priority"] is not None:
+        r["priority"] = str(r["priority"]).strip().lower()
+    if r["progress"] is not None and not 0 <= r["progress"] <= 1:
+        _fail(r, "progress must be between 0.0 and 1.0.")
+    if r["color"] is not None and not mcolors.is_color_like(r["color"]):
+        _fail(r, f"color {r['color']!r} is not a valid color (use e.g. '#2169D8').")
+
+    if k in ("group", "task", "event"):
+        r["start"] = _day(r, "start", r["start"])
+        r["end"] = _day(r, "end", r["end"])
+    elif k == "milestone":
+        r["start"] = _day(r, "date", r["start"])
+    elif k == "deadline":
+        raw = r["start"]
+        r["dt"] = _ts(r, "date", raw)
+        if r["dt"] is None:
+            _fail(r, "a deadline needs a date.")
+        r["has_time"] = bool(r["dt"] != r["dt"].normalize() or (isinstance(raw, str) and ":" in raw))
+        r["start"] = r["end"] = r["dt"].normalize()
+    if k == "event":
+        if r["start"] is None:
+            _fail(r, "an event needs a start date.")
+        if r["end"] is None:
+            r["end"] = r["start"]
+        if r["end"] < r["start"]:
+            _fail(r, "the end date is before the start date.")
+    if k == "task":
+        if r["duration"] is not None and (not isinstance(r["duration"], int) or r["duration"] < 1):
+            _fail(r, "duration must be a whole number of days, at least 1.")
+        if not isinstance(r["buffer"], int) or r["buffer"] < 0:
+            _fail(r, "buffer must be a whole number of days, 0 or more.")
+        if r["baseline"] is not None:
+            try:
+                b0, b1 = r["baseline"]
+            except (TypeError, ValueError):
+                _fail(r, "baseline must be a pair of dates: ('2026-11-01', '2026-11-10').")
+            r["baseline"] = (_day(r, "baseline start", b0), _day(r, "baseline end", b1))
+            if r["baseline"][1] < r["baseline"][0]:
+                _fail(r, "the baseline ends before it starts.")
+    else:
+        r["buffer"] = 0
+    r["deps"] = _parse_deps(r) if k in ("task", "milestone") else []
+
+for r in rows:
+    for pid, _, _ in r["deps"]:
+        if pid not in byid:
+            _fail(r, f"depends on '{pid}', but there is no row with this id. "
+                     f"Known ids: {', '.join(byid)}.")
+        if pid == r["id"]:
+            _fail(r, "cannot depend on itself.")
+
+
+# --- 2b) calculate dates, predecessors first ---
+def end_eff(p):
+    """End of a row including its buffer."""
+    return p["end"] + p["buffer"] * DAY
+
+
+def resolve_task(r):
+    s, e, du = r["start"], r["end"], r["duration"]
+    start_c, end_c = [], []
+    for pid, typ, lag in r["deps"]:
+        p = byid[pid]
+        if typ == "FS":
+            c = end_eff(p) + (1 + lag) * DAY
+            start_c.append(next_workday(c) if DURATION_IN_WORKDAYS else c)
+        elif typ == "SS":
+            start_c.append(p["start"] + lag * DAY)
+        else:
+            end_c.append(p["end"] + lag * DAY)
+
+    if s is None and start_c and not (e is not None and du is not None):
+        s = max(start_c)
+    if s is None and e is None and end_c and du is not None:
+        e = max(end_c)
+
+    if s is not None and e is not None:
+        if e < s:
+            _fail(r, "the end date is before the start date.")
+        if du is not None and du != count_days(s, e):
+            _fail(r, f"start ({s:%Y-%m-%d}), end ({e:%Y-%m-%d}) and duration ({du}) do not "
+                     f"match. Give only two of them.")
+        du = count_days(s, e)
+    elif s is not None and du is not None:
+        e = add_duration(s, du)
+    elif e is not None and du is not None:
+        s = sub_duration(e, du)
+    else:
+        _fail(r, "not enough information. Give two of start / end / duration, or a "
+                 "dependency (dep=...) together with a duration.")
+    r["start"], r["end"], r["duration"] = s, e, du
+
+
+def resolve_milestone(r):
+    d = r["start"]
+    if d is None:
+        cands = []
+        for pid, typ, lag in r["deps"]:
+            p = byid[pid]
+            base = {"FS": end_eff(p), "SS": p["start"], "FF": p["end"]}[typ]
+            cands.append(base + lag * DAY)
+        if not cands:
+            _fail(r, "needs a date, or a dependency (dep=...) to take the date from.")
+        d = max(cands)
+    r["start"] = r["end"] = d.normalize()
+
+
+pending = [r for r in rows if r["kind"] in ("task", "milestone")]
+resolved = {r["id"] for r in rows if r["kind"] in ("deadline", "event")}
+while pending:
+    ready = [r for r in pending if all(pid in resolved for pid, _, _ in r["deps"])]
+    if not ready:
+        names = ", ".join(f"'{r['id']}'" for r in pending)
+        raise PlanError(f"Circular dependency between: {names}. Check the 'dep' arguments.")
+    for r in ready:
+        (resolve_task if r["kind"] == "task" else resolve_milestone)(r)
+        resolved.add(r["id"])
+        pending.remove(r)
+
+# warn if manually entered dates break a dependency
+for r in rows:
+    for pid, typ, lag in r["deps"]:
+        p = byid[pid]
+        point = r["kind"] in POINT_KINDS
+        if typ == "FS":
+            need, actual = end_eff(p) + (lag + (0 if point else 1)) * DAY, r["start"]
+        elif typ == "SS":
+            need, actual = p["start"] + lag * DAY, r["start"]
+        else:
+            need, actual = p["end"] + lag * DAY, r["end"]
+        if actual < need:
+            print(f"WARNING: '{r['name']}' is scheduled earlier than its dependency "
+                  f"'{p['name']}' ({typ}{lag:+d}) allows.")
+
+# --- 2c) tasks get progress, phases get dates + progress, rows get a position ---
+cur = None
+for r in rows:
+    r["group"] = cur
+    if r["kind"] == "group":
+        cur = r
+        cur["children"] = []
+    elif cur is not None:
+        cur["children"].append(r)
+    if r["kind"] == "task" and r["progress"] is None:
+        r["progress"] = 1.0 if r["status"] == "done" else 0.0
+
+for g in [r for r in rows if r["kind"] == "group"]:
+    tasks = [c for c in g["children"] if c["kind"] == "task"]
+    if g["start"] is None and tasks:
+        g["start"] = min(t["start"] for t in tasks)
+    if g["end"] is None and tasks:
+        g["end"] = max(t["end"] for t in tasks)
+    g["bar"] = g["start"] is not None and g["end"] is not None
+    if g["bar"]:
+        g["duration"] = count_days(g["start"], g["end"])
+    if g["progress"] is None:
+        total = sum(t["duration"] for t in tasks)
+        g["progress"] = sum(t["progress"] * t["duration"] for t in tasks) / total if total else 0.0
+
+for r in rows:
+    if r["kind"] == "event":
+        r["duration"] = count_days(r["start"], r["end"])
+
+for i, r in enumerate(rows):
+    r["row"] = i
+n = len(rows)
+if not any(r["kind"] != "group" for r in rows):
+    raise PlanError("The plan is empty. Add at least one task.")
+
+# --- 2d) time range of the chart ---
+all_dates = []
+for r in rows:
+    if r["kind"] == "group":
+        if r["bar"]:
+            all_dates += [r["start"], r["end"]]
+        continue
+    all_dates += [r["start"], end_eff(r)]
+    if r["baseline"]:
+        all_dates += list(r["baseline"])
+first = pd.Timestamp(TIMELINE_START) if TIMELINE_START else min(all_dates)
+last = pd.Timestamp(TIMELINE_END) if TIMELINE_END else max(all_dates)
+start_week = first.normalize() - first.weekday() * DAY
+_pad = last.normalize() + 2 * DAY                           # room for the last diamond / label
+end_week = _pad if _pad.weekday() == 0 else _pad + (7 - _pad.weekday()) * DAY
+x_left, x_right = mdates.date2num(start_week), mdates.date2num(end_week)
+
+# ------------------------------------------------------------
+# 3) Figure layout (all sizes in inches, so the look is the same for any plan)
+# ------------------------------------------------------------
+NAME_IN, TIMELINE_IN, ROW_IN, SIDE = 3.04, 10.56, 0.385, 0.03
+COL_IN = {"owner": 0.95, "start": 0.72, "end": 0.72, "duration": 0.55,
+          "progress": 0.60, "status": 1.05, "priority": 0.80}
+for _c in TABLE_COLUMNS:
+    if _c not in COL_IN:
+        raise PlanError(f"TABLE_COLUMNS: unknown column {_c!r}. Available: {', '.join(COL_IN)}.")
+table_in = NAME_IN + sum(COL_IN[c] for c in TABLE_COLUMNS)
+day_in = TIMELINE_IN / (x_right - x_left)                   # inches per day
+
+
+def px(inches):
+    """Converts a length in inches into days on the timeline."""
+    return inches / day_in
+
+
+def dnum(ts):
+    return mdates.date2num(ts)
+
+
+def darken(color, f=0.78):
+    return tuple(v * f for v in mcolors.to_rgb(color))
+
+
+# --- positions of every row on the timeline ---
+BAR_H = {"group": 0.62, "task": 0.5}
+for r in rows:
+    k = r["kind"]
+    r["y"] = r["row"] + 0.5
+    if k == "group":
+        r["h"] = BAR_H["group"] / 2
+        if r["bar"]:
+            r["xs"], r["xe"] = dnum(r["start"]), dnum(r["end"]) + 1
+            r["xe_eff"] = r["xe"]
+    elif k == "task":
+        r["h"] = BAR_H["task"] / 2
+        r["xs"], r["xe"] = dnum(r["start"]), dnum(r["end"]) + 1
+        r["xe_eff"] = r["xe"] + r["buffer"]
+    elif k == "milestone":
+        r["h"] = 0.2
+        r["xs"] = r["xe"] = r["xe_eff"] = dnum(r["end"]) + 1
+    elif k == "deadline":
+        r["h"] = 0.2
+        r["xs"] = r["xe"] = r["xe_eff"] = dnum(r["dt"]) if r["has_time"] else dnum(r["end"]) + 1
+    else:
+        r["h"] = 0.15 if r["start"] == r["end"] else 0.11
+        r["xs"], r["xe"] = dnum(r["start"]), dnum(r["end"]) + 1
+        r["xe_eff"] = r["xe"]
+
+# --- what appears in the legend ---
+uses = dict(
+    group=any(r["kind"] == "group" and r["bar"] for r in rows),
+    task=any(r["kind"] == "task" and not r["ext"] for r in rows),
+    ext=any(r["ext"] for r in rows if r["kind"] in ("task", "group")),
+    done=any(r["kind"] == "task" and r["progress"] > 0 for r in rows),
+    milestone=any(r["kind"] == "milestone" for r in rows),
+    deadline=any(r["kind"] == "deadline" for r in rows),
+    event=any(r["kind"] == "event" for r in rows),
+    buffer=any(r["buffer"] > 0 for r in rows),
+    baseline=any(r["baseline"] for r in rows),
+    risk=any(r["status"] in RISK_STATUSES for r in rows),
+    dep=any(r["deps"] for r in rows),
+)
+visible_nw = [(s, e, lab) for s, e, lab in NW_RANGES
+              if dnum(e) + 1 > x_left and dnum(s) < x_right]
+FLAG = [(0, -1), (0, 1), (1, 0.45), (0, -0.05)]              # marker shape of a deadline flag
+handles = []
+if uses["group"]:
+    handles.append(Patch(facecolor=GROUP_LIGHT, label=LABELS["legend_phase"]))
+if uses["task"]:
+    handles.append(Patch(facecolor=TASK_LIGHT, label=LABELS["legend_task"]))
+if uses["ext"]:
+    handles.append(Patch(facecolor=EXT_LIGHT, edgecolor=EXT_HATCH, hatch="///",
+                         label=LABELS["legend_ext"]))
+if uses["done"]:
+    handles.append(Patch(facecolor=TASK_DARK, label=LABELS["legend_done"]))
+if uses["buffer"]:
+    handles.append(Patch(facecolor=TASK_LIGHT, alpha=0.3, edgecolor=TASK_LIGHT, linestyle="--",
+                         label=LABELS["legend_buffer"]))
+if uses["baseline"]:
+    handles.append(Patch(facecolor=BASELINE, label=LABELS["legend_baseline"]))
+if uses["milestone"]:
+    handles.append(Line2D([0], [0], marker="D", color="none", markerfacecolor=MILESTONE,
+                          markeredgecolor="white", markersize=9, label=LABELS["legend_milestone"]))
+if uses["deadline"]:
+    handles.append(Line2D([0], [0], marker=FLAG, color="none", markerfacecolor=DEADLINE,
+                          markeredgecolor=DEADLINE, markersize=10, label=LABELS["legend_deadline"]))
+if uses["event"]:
+    handles.append(Line2D([0], [0], marker="^", color="none", markerfacecolor=EVENT,
+                          markeredgecolor="white", markersize=9, label=LABELS["legend_event"]))
+if uses["risk"]:
+    handles.append(Line2D([0], [0], marker="o", color="none", markerfacecolor=STATUS_STYLES["at risk"],
+                          markeredgecolor="white", markersize=9, label=LABELS["legend_risk"]))
+if visible_nw:
+    handles.append(Patch(facecolor=NONWORK_FC, edgecolor=NONWORK_EC, hatch="\\\\",
+                         label=LABELS["legend_nonwork"]))
+if uses["dep"]:
+    handles.append(Line2D([0], [0], color=DEP_LINE, lw=1.2, label=LABELS["legend_dep"]))
+legend_cols = min(6, max(1, len(handles)))
+legend_rows = math.ceil(len(handles) / legend_cols)
+
+axes_h = (n + 2) * ROW_IN
+top_in, bottom_in = 1.45, 0.65 + 0.30 * legend_rows
+fig_w = (TIMELINE_IN + table_in) / (1 - 2 * SIDE)
+fig_h = top_in + axes_h + bottom_in
+
+fig = plt.figure(figsize=(fig_w, fig_h), facecolor=BG)
+fig.add_artist(FancyBboxPatch(
+    (0.008, 0.01), 0.984, 0.98, boxstyle="round,pad=0,rounding_size=0.012",
+    transform=fig.transFigure, fc="white", ec=GRID, lw=1, zorder=-10))  # behind the axes
+
+ax_t = fig.add_axes([SIDE, bottom_in / fig_h, table_in / fig_w, axes_h / fig_h])    # table
+ax_g = fig.add_axes([SIDE + table_in / fig_w, bottom_in / fig_h,
+                     TIMELINE_IN / fig_w, axes_h / fig_h])                           # timeline
+
+for ax in (ax_t, ax_g):
+    ax.set_facecolor("none")                     # transparent axes background
+    ax.set_ylim(n, -2)
+    ax.set_xticks([]); ax.set_yticks([])
+    for s in ax.spines.values():
+        s.set_visible(False)
+ax_t.set_xlim(0, table_in)                       # 1 unit = 1 inch
+ax_g.set_xlim(x_left, x_right)
+
+fig.text(0.035, 1 - 0.72 / fig_h, PROJECT_TITLE, fontsize=18, fontweight="bold", color=TEXT)
+fig.text(0.035, 1 - 1.02 / fig_h, PROJECT_SUBTITLE, fontsize=10, color=TEXT_MUTED)
+if PROJECT_META:
+    fig.text(1 - 0.035, 1 - 0.72 / fig_h, PROJECT_META, fontsize=9, color=TEXT_MUTED, ha="right")
+
+renderer = fig.canvas.get_renderer()             # needed to measure texts
+
+
+def extent(artist, ax):
+    """Horizontal extent of a text, in data coordinates of `ax`."""
+    bb = artist.get_window_extent(renderer)
+    inv = ax.transData.inverted()
+    return inv.transform((bb.x0, bb.y0))[0], inv.transform((bb.x1, bb.y1))[0]
+
+
+def fit_text(t, ax, max_right, min_size=7.0):
+    """Shrinks (then shortens) a text so it does not run into the next column."""
+    while extent(t, ax)[1] > max_right and t.get_fontsize() > min_size:
+        t.set_fontsize(t.get_fontsize() - 0.5)
+    core = t.get_text()
+    while extent(t, ax)[1] > max_right and len(core) > 3:
+        core = core[:-1]
+        t.set_text(core.rstrip() + "…")
+
+
+def place_text(xl, xr, y, s, prefer="left", gap_in=0.2, **style):
+    """Puts a label left of `xl` or right of `xr`; switches side if it would leave the chart."""
+    t = ax_g.text(0, y, s, va="center", zorder=3, **style)
+    gap = px(gap_in)
+
+    def put(side):
+        if side == "right":
+            t.set_x(xr + gap); t.set_ha("left")
+        else:
+            t.set_x(xl - gap); t.set_ha("right")
+        x0, x1 = extent(t, ax_g)
+        return x0, x1, (x0 >= x_left + px(0.04) and x1 <= x_right - px(0.04))
+
+    order = [prefer, "left" if prefer == "right" else "right"]
+    for side in order:
+        x0, x1, ok = put(side)
+        if ok:
+            return t, side, x0, x1
+    x0, x1, _ = put(order[0])
+    return t, order[0], x0, x1
+
+
+def label_and_note(xm, y, label, note, gap_in, **label_style):
+    """Label next to a marker plus an optional note; the note never lands on top of the label."""
+    t, side, x0, x1 = place_text(xm, xm, y, label, prefer="left", gap_in=gap_in, **label_style)
+    if not note:
+        return
+    if side == "left":      # label on the left: note right of the marker, else left of the label
+        place_text(x0, xm, y, note, prefer="right", gap_in=gap_in, **NOTE_STYLE)
+    else:                   # label on the right: note behind the label, else left of the marker
+        place_text(xm, x1, y, note, prefer="right", gap_in=0.12, **NOTE_STYLE)
+
+
+# ------------------------------------------------------------
+# 4) Background, grid, header (months + calendar weeks)
+# ------------------------------------------------------------
+ax_g.add_patch(Rectangle((x_left, -2), x_right - x_left, 2, fc="#F9FAFB", ec="none", zorder=0.5))
+ax_t.add_patch(Rectangle((0, -2), table_in, 2, fc="#F9FAFB", ec="none", zorder=0.5))
+
+if SHADE_WEEKENDS:
+    for d in pd.date_range(start_week, end_week - DAY):
+        if d.weekday() >= 5:
+            ax_g.add_patch(Rectangle((dnum(d), 0), 1, n, fc=WEEKEND_FC, ec="none", zorder=0.7))
+
+for s, e, lab in visible_nw:
+    x0, x1 = max(dnum(s), x_left), min(dnum(e) + 1, x_right)
+    ax_g.add_patch(Rectangle((x0, 0), x1 - x0, n, fc=NONWORK_FC, ec=NONWORK_EC, lw=0,
+                             hatch="\\\\", zorder=0.8))
+    if lab:
+        ax_g.text((x0 + x1) / 2, n + 0.12, lab, ha="center", va="top", fontsize=7.5,
+                  color=TEXT_MUTED)
+
+for i in range(n + 1):
+    for ax in (ax_t, ax_g):
+        ax.axhline(i, color=GRID, lw=0.8, zorder=1)
+for y in (-2, -1):
+    ax_g.axhline(y, color=GRID, lw=0.8, zorder=1)
+ax_t.axhline(-2, color=GRID, lw=0.8, zorder=1)
+
+for m in pd.date_range(start_week.replace(day=1), end_week, freq="MS"):
+    x0 = dnum(max(m, start_week))
+    x1 = dnum(min(m + pd.offsets.MonthBegin(1), end_week))
+    if x1 <= x0:
+        continue
+    width_in = (x1 - x0) * day_in
+    label = f"{m:%B %Y}" if width_in >= 1.25 else (f"{m:%b}" if width_in >= 0.45 else "")
+    ax_g.text((x0 + x1) / 2, -1.5, label, ha="center", va="center",
+              fontsize=9.5, fontweight="bold", color=TEXT)
+    ax_g.plot([x0, x0], [-2, -1], color=GRID, lw=0.8, zorder=1)
+
+week_step = max(1, math.ceil(0.5 / (7 * day_in)))           # thin out week labels on long plans
+for i, mon in enumerate(pd.date_range(start_week, end_week, freq="W-MON")):
+    xw = dnum(mon)
+    ax_g.plot([xw, xw], [-1, n], color=GRID, lw=0.8, zorder=1)
+    if mon < end_week and i % week_step == 0:
+        ax_g.text(xw + 3.5, -0.5, f"{LABELS['week']} {mon.isocalendar()[1]}", ha="center",
+                  va="center", fontsize=8, color=TEXT_MUTED)
+
+if SHOW_DEADLINE_LINES:
+    for r in rows:
+        if r["kind"] == "deadline":
+            ax_g.plot([r["xs"], r["xs"]], [0, n], color=DEADLINE, lw=1.0, alpha=0.5,
+                      ls=(0, (4, 3)), zorder=1.5)
+
+# ------------------------------------------------------------
+# 5) Task table (left)
+# ------------------------------------------------------------
+col_x, _cx = {}, NAME_IN
+for c in TABLE_COLUMNS:
+    col_x[c] = _cx
+    _cx += COL_IN[c]
+
+ax_t.text(0.09, -1, LABELS["task"], va="center", fontsize=9.5, fontweight="bold", color=TEXT_MUTED)
+for c in TABLE_COLUMNS:
+    ax_t.text(col_x[c], -1, LABELS[c], va="center", fontsize=9.5, fontweight="bold",
+              color=TEXT_MUTED)
+
+
+def cell_text(r, key):
+    k = r["kind"]
+    has_bar = not (k == "group" and not r["bar"])
+    if key == "owner":
+        return r["owner"] or ""
+    if key == "start":
+        if k in POINT_KINDS or not has_bar or (k == "event" and r["start"] == r["end"]):
+            return ""
+        return f"{r['start']:{DATE_FORMAT}}"
+    if key == "end":
+        return f"{r['end']:{DATE_FORMAT}}" if has_bar else ""
+    if key == "duration":
+        return str(r["duration"]) if has_bar and k not in POINT_KINDS else ""
+    if key == "progress":
+        return f"{r['progress']:.0%}" if has_bar and k in ("task", "group") else ""
+    if key == "priority":
+        return (r["priority"] or "").capitalize()
+    return ""
+
+
+for r in rows:
+    y, k = r["y"], r["kind"]
+    col = EXT_TEXT if r["ext"] else TEXT
+    if k == "group":
+        t = ax_t.text(0.09, y, "▾  " + r["name"], va="center", fontsize=9.5,
+                      fontweight="bold", color=col)
+    elif k == "task":
+        t = ax_t.text(0.31, y, r["name"], va="center", fontsize=9, color=col)
+    elif k == "milestone":
+        t = ax_t.text(0.31, y, "◆  " + r["name"], va="center", fontsize=9, color=MILESTONE_T)
+    elif k == "deadline":
+        t = ax_t.text(0.31, y, "⚑  " + r["name"], va="center", fontsize=9, color=DEADLINE)
+    else:
+        t = ax_t.text(0.31, y, "▲  " + r["name"], va="center", fontsize=9, color=EVENT)
+    fit_text(t, ax_t, NAME_IN - 0.08)
+
+    for c in TABLE_COLUMNS:
+        if c == "status":
+            if r["status"]:
+                ax_t.scatter([col_x[c] + 0.08], [y], s=26, color=STATUS_STYLES[r["status"]],
+                             edgecolors="none", zorder=3)
+                ts = ax_t.text(col_x[c] + 0.19, y, r["status"].capitalize(), va="center",
+                               fontsize=8.5, color=TEXT_MUTED)
+                fit_text(ts, ax_t, col_x[c] + COL_IN[c] - 0.04, min_size=7.0)
+            continue
+        txt = cell_text(r, c)
+        if not txt:
+            continue
+        color = PRIORITY_COLORS.get(r["priority"], TEXT_MUTED) if c == "priority" else TEXT_MUTED
+        tc = ax_t.text(col_x[c], y, txt, va="center", fontsize=8.5, color=color)
+        fit_text(tc, ax_t, col_x[c] + COL_IN[c] - 0.04)
+
+# ------------------------------------------------------------
+# 6) Bars, markers, notes
+# ------------------------------------------------------------
+NOTE_STYLE = dict(fontsize=8, color=TEXT_MUTED, fontstyle="italic")
+
+for r in rows:
+    y, k = r["y"], r["kind"]
+
+    if k in ("group", "task"):
+        if k == "group" and not r["bar"]:
+            continue
+        h = BAR_H[k]
+        if r["color"]:
+            light, dark = r["color"], darken(r["color"])
+        elif r["ext"]:
+            light, dark = EXT_LIGHT, EXT_DARK
+        elif k == "group":
+            light, dark = GROUP_LIGHT, GROUP_DARK
+        else:
+            light, dark = TASK_LIGHT, TASK_DARK
+        xs, xe = r["xs"], r["xe"]
+        w, p = xe - xs, r["progress"]
+
+        ax_g.add_patch(Rectangle((xs, y - h / 2), w, h, fc=light, zorder=2,
+                                 ec=EXT_HATCH if r["ext"] else "none", lw=0,
+                                 hatch="///" if r["ext"] else None))
+        if p > 0:
+            ax_g.add_patch(Rectangle((xs, y - h / 2), w * p, h, fc=dark, ec="none", zorder=2.1))
+            if w * day_in >= 0.4:
+                ax_g.text(xs + px(0.07), y, f"{p:.0%}", va="center", fontsize=7.5,
+                          fontweight="bold", color="white", zorder=3)
+        if r["buffer"] > 0:
+            ax_g.add_patch(Rectangle((xe, y - h / 2), r["buffer"], h, fc=light, alpha=0.3,
+                                     ec=light, lw=1.0, ls="--", zorder=2))
+        if r["baseline"]:
+            b0, b1 = dnum(r["baseline"][0]), dnum(r["baseline"][1]) + 1
+            ax_g.add_patch(Rectangle((b0, y + h / 2 + 0.05), b1 - b0, 0.07, fc=BASELINE,
+                                     ec="none", zorder=2))
+        if r["status"] in RISK_STATUSES:
+            xm = xe - px(0.13) if w * day_in >= 0.5 else xs + w / 2
+            ax_g.scatter([xm], [y], s=70, color=STATUS_STYLES[r["status"]], edgecolors="white",
+                         linewidths=1.0, zorder=4)
+            ax_g.text(xm, y, "!", ha="center", va="center", fontsize=7, fontweight="bold",
+                      color="white" if r["status"] == "blocked" else TEXT, zorder=4.1)
+        if r["note"]:
+            place_text(xs, r["xe_eff"], y, r["note"], prefer="right", gap_in=0.17, **NOTE_STYLE)
+
+    elif k == "milestone":
+        xm = r["xs"]
+        ax_g.scatter([xm], [y], marker="D", s=110, color=r["color"] or MILESTONE,
+                     edgecolors="white", linewidths=1.2, zorder=5)
+        label_and_note(xm, y, r["name"], r["note"], 0.2,
+                       fontsize=8.5, fontweight="bold", color=MILESTONE_T)
+
+    elif k == "deadline":
+        xm = r["xs"]
+        ax_g.scatter([xm], [y], marker=FLAG, s=150, color=r["color"] or DEADLINE,
+                     edgecolors=r["color"] or DEADLINE, linewidths=1.2, zorder=5)
+        label = r["name"] + (f"  {r['dt']:%H:%M}" if r["has_time"] else "")
+        label_and_note(xm, y, label, r["note"], 0.17,
+                       fontsize=8.5, fontweight="bold", color=DEADLINE)
+
+    else:  # event
+        color = r["color"] or EVENT
+        if r["start"] == r["end"]:
+            xm = r["xs"] + 0.5
+            ax_g.scatter([xm], [y], marker="^", s=75, color=color, edgecolors="white",
+                         linewidths=1.0, zorder=5)
+            label_and_note(xm, y, r["name"], r["note"], 0.15,
+                           fontsize=8.5, fontweight="bold", color=color)
+        else:
+            ax_g.add_patch(Rectangle((r["xs"], y - 0.11), r["xe"] - r["xs"], 0.22, fc=color,
+                                     ec="none", zorder=2))
+            if r["note"]:
+                place_text(r["xs"], r["xe"], y, r["note"], prefer="right", gap_in=0.17, **NOTE_STYLE)
+
+# ------------------------------------------------------------
+# 7) Dependencies
+# ------------------------------------------------------------
+def arrow(p_from, p_to):
+    ax_g.annotate("", xy=p_to, xytext=p_from, zorder=4,
+                  arrowprops=dict(arrowstyle="-|>", color=DEP_LINE, lw=1.1,
+                                  shrinkA=0, shrinkB=0, mutation_scale=9))
+
+
+def polyline(pts):
+    ax_g.plot([p[0] for p in pts], [p[1] for p in pts], color=DEP_LINE, lw=1.1,
+              zorder=3, solid_joinstyle="miter", clip_on=False)   # not clipped at the chart edge
+
+
+Dx = px(0.085)                                   # length of the short stubs next to the bars
+for r in rows:
+    for pid, typ, lag in r["deps"]:
+        a = byid[pid]
+        ya, yb = a["y"], r["y"]
+        down = yb >= ya
+        edge = ya + 0.5 if down else ya - 0.5    # border of the predecessor's row
+        point = r["kind"] in POINT_KINDS
+        tip = px(0.10) if point else 0           # stop in front of a diamond / flag
+
+        if typ == "FS":
+            xf, xt = a["xe_eff"], r["xs"]
+            if point and abs(xf - xt) < px(0.06):          # straight line into a milestone
+                arrow((xf, ya + (a["h"] if down else -a["h"])),
+                      (xt, yb - (r["h"] if down else -r["h"])))
+                continue
+            pts = [(xf, ya), (xf + Dx, ya), (xf + Dx, edge), (xt - Dx, edge), (xt - Dx, yb)]
+            polyline(pts)
+            arrow(pts[-1], (xt - tip, yb))
+        elif typ == "SS":
+            xf, xt = a["xs"], r["xs"]
+            xv = min(xf, xt) - Dx
+            polyline([(xf, ya), (xv, ya), (xv, yb)])
+            arrow((xv, yb), (xt - tip, yb))
+        else:  # FF
+            xf, xt = a["xe_eff"], r["xe"]
+            xv = max(xf, xt) + Dx
+            polyline([(xf, ya), (xv, ya), (xv, yb)])
+            arrow((xv, yb), (xt + tip, yb))
+
+# ------------------------------------------------------------
+# 8) "Today" marker (only if inside the plan period)
+# ------------------------------------------------------------
+if TODAY is not False:
+    today = pd.Timestamp(TODAY).normalize() if TODAY else pd.Timestamp.today().normalize()
+    if start_week <= today <= end_week:
+        xt = dnum(today)
+        ax_g.plot([xt, xt], [0, n], color=TODAY_COLOR, lw=1.4, ls="--", zorder=4)
+        ax_g.text(xt, n + 0.62, LABELS["today"], ha="center", va="center", fontsize=7.5,
+                  fontweight="bold", color="white", zorder=6,
+                  bbox=dict(boxstyle="round,pad=0.25", fc=TODAY_COLOR, ec="none"))
+
+# ------------------------------------------------------------
+# 9) Legend (only shows what is used in the plan)
+# ------------------------------------------------------------
+fig.legend(handles=handles, loc="lower center", bbox_to_anchor=(0.5, 0.2 / fig_h),
+           ncol=legend_cols, frameon=False, fontsize=9, labelcolor=TEXT_MUTED)
+
+plt.savefig(OUTPUT_FILE, dpi=DPI, bbox_inches="tight", facecolor=fig.get_facecolor())
+print(f"Saved {OUTPUT_FILE}")
+if SHOW_WINDOW:
+    plt.show()
+else:
+    plt.close(fig)
