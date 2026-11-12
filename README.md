@@ -4,6 +4,8 @@ Modern-looking GANTT charts from a few lines of Python. Describe your project on
 
 Everything here is free to use, copy and adapt. No account, no web service, no subscription, just Python.
 
+*Note: I use Jupyter Notebook for this.*
+
 **What you get**
 
 - A clean, modern design with phases, tasks, milestones, progress, calendar weeks and a "today" line
