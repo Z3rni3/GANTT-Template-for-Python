@@ -1,4 +1,4 @@
-# GANTT-Template-for-Python
+## GANTT-Template-for-Python
 
 Modern-looking GANTT charts from a few lines of Python. Describe your project once (phases, tasks, milestones), run a single file, and get a clean, high-resolution picture you can drop into a report, a poster, a presentation or a README.
 
